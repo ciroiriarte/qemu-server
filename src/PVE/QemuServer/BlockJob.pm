@@ -83,8 +83,12 @@ sub qemu_blockjobs_cancel {
 # 'cancel': wait until all jobs are ready, block-job-cancel them
 # 'skip': wait until all jobs are ready, return with block jobs in ready state
 # 'auto': wait until all jobs disappear, only use for jobs which complete automatically
+#
+# $on_frozen is an optional coderef, run while the guest is frozen (or suspended) at the
+# instant the mirror jobs are cut over. Clone uses it to start storage-offloaded copies
+# there, so that a VM's offloaded and mirrored disks share one point in time.
 sub monitor {
-    my ($qmp_peer, $vmiddst, $jobs, $completion, $qga, $op) = @_;
+    my ($qmp_peer, $vmiddst, $jobs, $completion, $qga, $op, $on_frozen) = @_;
 
     die "drive mirror: different destination is only supported when peer is main QEMU instance\n"
         if $vmiddst && $qmp_peer->{type} ne 'qmp';
@@ -179,8 +183,22 @@ sub monitor {
                         warn $@ if $@;
                     }
 
-                    # if we clone a disk for a new target vm, we don't switch the disk
-                    qemu_blockjobs_cancel($qmp_peer, $jobs);
+                    # Everything done while the guest is stopped goes in here, and its
+                    # error is held until after the thaw below. Leaving a guest frozen or
+                    # suspended is far worse than failing the clone, so nothing between
+                    # the freeze and the thaw may die -- including the job cancel, which
+                    # can fail on its own.
+                    my $frozen_err;
+                    eval {
+                        # Storage-offloaded copies start here: their point in time is
+                        # fixed by the start, so doing it inside the freeze is what puts
+                        # them at the same instant as the mirrored disks cut over below.
+                        $on_frozen->() if $on_frozen;
+
+                        # if we clone a disk for a new target vm, we don't switch the disk
+                        qemu_blockjobs_cancel($qmp_peer, $jobs);
+                    };
+                    $frozen_err = $@;
 
                     if ($should_fsfreeze) {
                         print "issuing guest agent 'guest-fsfreeze-thaw' command\n";
@@ -191,6 +209,9 @@ sub monitor {
                         eval { PVE::QemuServer::RunState::vm_resume($vmid, 1, 1); };
                         warn $@ if $@;
                     }
+
+                    # re-raise only now that the guest is running again
+                    die $frozen_err if $frozen_err;
 
                     last;
                 } else {
@@ -281,6 +302,7 @@ sub qemu_drive_mirror {
         $qga,
         $bwlimit,
         $src_bitmap,
+        $on_frozen,
     ) = @_;
 
     my $device_id = "drive-$drive_id";
@@ -316,7 +338,7 @@ sub qemu_drive_mirror {
         die "mirroring error: $err\n";
     }
 
-    monitor(vm_qmp_peer($vmid), $vmiddst, $jobs, $completion, $qga);
+    monitor(vm_qmp_peer($vmid), $vmiddst, $jobs, $completion, $qga, undef, $on_frozen);
 }
 
 # Callers should version guard this (only available with a binary >= QEMU 8.2)
@@ -520,6 +542,7 @@ sub blockdev_mirror {
         $completion,
         $options->{'guest-agent'},
         'mirror',
+        $options->{'on-frozen'},
     );
 }
 
@@ -543,6 +566,7 @@ sub mirror {
             $options->{'guest-agent'},
             $options->{bwlimit},
             $source->{bitmap},
+            $options->{'on-frozen'},
         );
     }
 }

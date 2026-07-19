@@ -7923,8 +7923,96 @@ my sub clone_disk_check_io_uring {
         if $src_uses_io_uring && !storage_allows_io_uring_default($dst_scfg, $cache_direct);
 }
 
+# Start every deferred storage-offloaded copy. MUST be called with the guest frozen (or
+# suspended): the start is what fixes each copy's point in time, so doing them all here
+# is what makes a multi-disk clone consistent.
+#
+# Handed to the storage layer as ONE batch rather than started in a loop, so a backend
+# that can capture several volumes at a single instant (an array consistency group) does
+# so. That makes the disks mutually crash-consistent in the backend itself rather than
+# only by virtue of this freeze, and collapses N backend calls into one -- which is what
+# keeps the guest's stall short on a VM with many disks.
+#
+# Kept deliberately cheap: the guest is stalled for the duration. The data movement runs
+# afterwards and is waited for by wait_deferred_copies(), with the guest running again.
+sub run_deferred_copies {
+    my ($storecfg, $deferred_copies) = @_;
+
+    return if !$deferred_copies;
+
+    # idempotent: never start a copy twice
+    my $pending = [grep { !$_->{started} } @$deferred_copies];
+    return if !scalar(@$pending);
+
+    # vdisk_copy_start_group() flags each copy as it starts it, so a failure partway
+    # through leaves an accurate record of what is actually running.
+    PVE::Storage::vdisk_copy_start_group($storecfg, $pending);
+
+    return;
+}
+
+# Wait for the deferred copies to become independent of their sources. Runs with the
+# guest already thawed: only the starts need the freeze, not the data movement.
+sub wait_deferred_copies {
+    my ($storecfg, $deferred_copies) = @_;
+
+    return if !$deferred_copies;
+
+    for my $copy (@$deferred_copies) {
+        # Never silently accept an unstarted copy: its target is allocated but its
+        # content is undefined, so returning it would hand out a corrupt disk.
+        die "internal error - offloaded copy of '$copy->{source}' was never started\n"
+            if !$copy->{started};
+
+        print("waiting for offloaded copy of '$copy->{source}' to become independent\n");
+        PVE::Storage::vdisk_copy_wait($storecfg, $copy->{target}, $copy->{source});
+    }
+}
+
+# Freeze the guest, start the deferred copies, thaw. Used when a clone has NO mirror
+# jobs to rendezvous with -- i.e. every disk was offloaded -- so there is no
+# BlockJob::monitor() freeze to piggyback on. Mirrors what monitor() does, including the
+# suspend/resume fallback when no guest agent is available.
+sub freeze_and_run_deferred_copies {
+    my ($storecfg, $vmid, $qga, $deferred_copies) = @_;
+
+    return if !$deferred_copies || !scalar(@$deferred_copies);
+
+    my $should_fsfreeze = PVE::QemuServer::Agent::guest_fs_freeze_applicable($qga, $vmid);
+    if ($should_fsfreeze) {
+        print "issuing guest agent 'guest-fsfreeze-freeze' command\n";
+        eval { PVE::QemuServer::Agent::guest_fs_freeze($vmid); };
+        warn $@ if $@;
+    } else {
+        print "suspend vm\n";
+        eval { PVE::QemuServer::RunState::vm_suspend($vmid, 1); };
+        warn $@ if $@;
+    }
+
+    eval { run_deferred_copies($storecfg, $deferred_copies) };
+    my $err = $@;
+
+    if ($should_fsfreeze) {
+        print "issuing guest agent 'guest-fsfreeze-thaw' command\n";
+        eval { PVE::QemuServer::Agent::guest_fs_thaw($vmid); };
+        warn $@ if $@;
+    } else {
+        print "resume vm\n";
+        eval { PVE::QemuServer::RunState::vm_resume($vmid, 1, 1); };
+        warn $@ if $@;
+    }
+
+    die $err if $err; # only after the guest is running again
+}
+
+# $deferred_copies is an optional arrayref collecting storage-offloaded copies whose
+# START must happen inside the caller's guest freeze; see the offload branch below and
+# run_deferred_copies(). Without it, a running source is never offloaded.
 sub clone_disk {
-    my ($storecfg, $source, $dest, $full, $newvollist, $jobs, $completion, $qga, $bwlimit) = @_;
+    my (
+        $storecfg, $source, $dest, $full, $newvollist, $jobs, $completion, $qga, $bwlimit,
+        $deferred_copies,
+    ) = @_;
 
     my ($vmid, $running) = $source->@{qw(vmid running)};
     my ($src_drivename, $drive, $snapname) = $source->@{qw(drivename drive snapname)};
@@ -7966,6 +8054,113 @@ sub clone_disk {
         if ($format && $format ne $dst_format) {
             warn "format '$format' is not supported by the target storage '$storeid' - using"
                 . " '$dst_format' instead\n";
+        }
+
+        # Storage-offloaded full copy (pve-storage copy_image).
+        #
+        # This replaces BOTH halves of the normal full-clone path: the backend creates
+        # the target volume itself, so there is no vdisk_alloc() here and no host-side
+        # copy afterwards. That is why the check sits before the allocation rather than
+        # as another branch next to the mirror/convert calls below.
+        #
+        # Skipped for the special drives: cloudinit is regenerated rather than copied,
+        # and efidisk0/tpmstate0 are allocated at a fixed size and copied with a
+        # size-limited qemu-img dd, which an opaque backend copy cannot reproduce.
+        # Checked on both drive names, since either side being special is disqualifying.
+        my $special_re = qr/^(?:efidisk0|tpmstate0)$/;
+        my $offload_special = drive_is_cloudinit($drive)
+            || (defined($dst_drivename) && $dst_drivename =~ $special_re)
+            || (defined($src_drivename) && $src_drivename =~ $special_re);
+
+        # Multi-disk consistency is a VM-level property here, not a per-volume one:
+        # clone_vm() calls clone_disk() once per drive with completion => 'skip' until
+        # the last one, and BlockJob::monitor() then waits for ALL mirror jobs to be
+        # ready, fs-freezes ONCE, and cuts every disk over at that single instant. An
+        # offload started per-disk right here would have no such rendezvous, so each disk
+        # would be captured at a different instant and a running multi-disk guest could
+        # be cloned torn -- a database whose data and journal live on separate disks
+        # being the obvious casualty.
+        #
+        # So for a RUNNING source the target is only ALLOCATED here, and the copy's start
+        # -- which is what fixes its point in time -- is deferred to $deferred_copies.
+        # The caller starts those inside the same freeze that cuts the mirrors over, so
+        # offloaded and mirrored disks of one VM share an instant. A stopped source needs
+        # no rendezvous and is copied inline.
+        my $offload_class = $offload_special
+            ? undef
+            : PVE::Storage::copy_offload_class(
+                $storecfg, $drive->{file}, $storeid, $snapname, $running,
+            );
+
+        # 'bulk' smears over a changing source, so it needs the bitmap-seed + mirror
+        # convergence for a running guest, which is not implemented: fall through to the
+        # host-side path rather than silently producing an inconsistent copy.
+        $offload_class = undef if $offload_class && $offload_class ne 'atomic' && $running;
+
+        # deferral requires a caller that will run the rendezvous
+        $offload_class = undef if $offload_class && $running && !$deferred_copies;
+
+        if ($offload_class && $running) {
+            print("offloading full copy to storage backend ($offload_class, deferred)\n");
+
+            $newvolid = PVE::Storage::vdisk_copy_prepare(
+                $storecfg, $drive->{file}, $storeid, $newvmid, $snapname,
+                { format => $dst_format },
+            );
+            push @$newvollist, $newvolid;
+
+            # recorded as plain volids: the starts are issued as one batch, so that a
+            # backend able to group them can capture every disk at a single instant
+            push @$deferred_copies, {
+                source => $drive->{file},
+                target => $newvolid,
+                snap => $snapname,
+            };
+
+            print("allocated target volume '$newvolid', copy starts at freeze\n");
+
+            # If this is the last disk and mirror jobs are pending, the rendezvous has
+            # to happen here: nothing after us will call monitor(), and those mirrors
+            # would never be completed. Starting the deferred copies from inside that
+            # same freeze is also what puts every disk at one instant.
+            if (($completion && $completion eq 'complete') && (scalar(keys %$jobs) > 0)) {
+                PVE::QemuServer::BlockJob::monitor(
+                    vm_qmp_peer($vmid), $newvmid, $jobs, $completion, $qga, undef,
+                    sub { run_deferred_copies($storecfg, $deferred_copies) },
+                );
+            }
+
+            goto no_data_clone;
+        }
+
+        if ($offload_class) {
+            # Complete any mirror jobs from previously cloned disks before finishing
+            # here, exactly as the cloudinit path below does: this disk may be the last
+            # one, and returning without completing would leave those transfers unfinished.
+            if (($completion && $completion eq 'complete') && (scalar(keys %$jobs) > 0)) {
+                PVE::QemuServer::BlockJob::monitor(
+                    vm_qmp_peer($vmid), $newvmid, $jobs, $completion, $qga,
+                );
+            }
+
+            print("offloading full copy to storage backend ($offload_class)\n");
+
+            $newvolid = PVE::Storage::vdisk_copy(
+                $storecfg,
+                $drive->{file},
+                $storeid,
+                $newvmid,
+                $snapname,
+                { format => $dst_format },
+                sub { print("copy progress: $_[0]%\n") },
+            );
+            push @$newvollist, $newvolid;
+
+            print("created target volume '$newvolid' on the backend\n");
+
+            PVE::Storage::activate_volumes($storecfg, [$newvolid]);
+
+            goto no_data_clone;
         }
 
         my $name = undef;
@@ -8024,6 +8219,10 @@ sub clone_disk {
             my $mirror_opts = {};
             $mirror_opts->{'guest-agent'} = $qga;
             $mirror_opts->{bwlimit} = $bwlimit if defined($bwlimit);
+            # Start any deferred offloaded copies inside the freeze this mirror's
+            # completion takes, putting every disk of the VM at one point in time.
+            $mirror_opts->{'on-frozen'} = sub { run_deferred_copies($storecfg, $deferred_copies) }
+                if $deferred_copies && scalar(@$deferred_copies);
             PVE::QemuServer::BlockJob::mirror(
                 $source_info,
                 $dest_info,

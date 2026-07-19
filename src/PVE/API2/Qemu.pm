@@ -4599,6 +4599,9 @@ __PACKAGE__->register_method({
 
             my $newvollist = [];
             my $jobs = {};
+            # storage-offloaded copies whose start is deferred into the guest freeze, so
+            # that every disk of a running VM is captured at the same instant
+            my $deferred_copies = [];
 
             eval {
                 local $SIG{INT} = local $SIG{TERM} = local $SIG{QUIT} = local $SIG{HUP} =
@@ -4650,6 +4653,7 @@ __PACKAGE__->register_method({
                         $completion,
                         $oldconf->{agent},
                         $clonelimit,
+                        $deferred_copies,
                     );
 
                     $newconf->{$opt} = PVE::QemuServer::print_drive($newdrive);
@@ -4657,6 +4661,19 @@ __PACKAGE__->register_method({
                     PVE::QemuConfig->write_config($newid, $newconf);
                     $i++;
                 }
+
+                # Anything still unstarted means there was no mirror cutover to
+                # piggyback the freeze on -- i.e. every disk was offloaded -- so freeze
+                # here. Keyed on the copies themselves rather than on %$jobs, so it
+                # cannot double-start if the job bookkeeping changes.
+                if (grep { !$_->{started} } @$deferred_copies) {
+                    PVE::QemuServer::freeze_and_run_deferred_copies(
+                        $storecfg, $vmid, $oldconf->{agent}, $deferred_copies,
+                    );
+                }
+
+                # the guest is running again; the data movement is waited for here
+                PVE::QemuServer::wait_deferred_copies($storecfg, $deferred_copies);
 
                 delete $newconf->{lock};
 
